@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scanner Resi - Packer Scan System</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#111827;color:#fff;font-family:Arial,sans-serif;padding:18px}
+.wrap{max-width:620px;margin:auto}.head{font-weight:800;font-size:18px;margin:8px 0}.desc{color:#cbd5e1;font-size:13px;line-height:1.5}
+.panel{background:#1f2937;border-radius:14px;padding:14px;margin-top:16px}
+button{border:0;border-radius:9px;padding:13px 16px;font-size:14px;font-weight:700;cursor:pointer}
+.primary{background:#2563eb;color:white}.secondary{background:#374151;color:white}.danger{background:#dc2626;color:white}
+button:disabled{opacity:.5}video{width:100%;background:#000;border-radius:10px;min-height:220px;object-fit:cover}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.controls button{flex:1}
+select{width:100%;padding:12px;border-radius:8px;margin-top:10px;background:#fff;color:#111827;border:0}
+#status{padding:12px;border-radius:9px;background:#374151;margin-top:12px;font-size:13px;line-height:1.5}
+.good{background:#166534!important}.bad{background:#991b1b!important}.hint{font-size:11px;color:#cbd5e1;margin-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">PACKER SCAN SYSTEM</div>
+  <div class="desc">Arahkan kamera belakang ke barcode pada label paket. Pastikan barcode terlihat jelas dan pencahayaan cukup.</div>
+  <div class="panel">
+    <video id="video" playsinline muted></video>
+    <div class="controls">
+      <button class="primary" id="start">AKTIFKAN KAMERA</button>
+      <button class="secondary" id="switch" disabled>GANTI KAMERA</button>
+      <button class="danger" id="stop" disabled>TUTUP KAMERA</button>
+    </div>
+    <select id="cameras" aria-label="Pilih kamera" hidden></select>
+    <div id="status">Tekan AKTIFKAN KAMERA untuk meminta izin kamera.</div>
+    <div class="hint">Jika izin tidak muncul, periksa izin kamera pada pengaturan browser. Halaman ini harus dibuka melalui HTTPS.</div>
+  </div>
+</div>
+<script type="module">
+import { BrowserMultiFormatReader, BarcodeFormat, DecodeHintType } from 'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/+esm';
+
+const video = document.getElementById('video');
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('start');
+const stopBtn = document.getElementById('stop');
+const switchBtn = document.getElementById('switch');
+const cameraSelect = document.getElementById('cameras');
+const params = new URLSearchParams(location.search);
+const token = params.get('token') || '';
+const parentOrigin = params.get('parentOrigin') || '';
+const formats = [
+  BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.EAN_13,
+  BarcodeFormat.EAN_8, BarcodeFormat.QR_CODE, BarcodeFormat.ITF,
+  BarcodeFormat.UPC_A, BarcodeFormat.UPC_E, BarcodeFormat.CODABAR
+];
+const hints = new Map();
+hints.set(DecodeHintType.POSSIBLE_FORMATS, formats);
+hints.set(DecodeHintType.TRY_HARDER, true);
+const reader = new BrowserMultiFormatReader(hints, { delayBetweenScanAttempts: 120, delayBetweenScanSuccess: 700 });
+let controls = null, cameraStream = null, devices = [], activeIndex = 0, busy = false;
+
+function status(message, type='') {
+  statusEl.textContent = message;
+  statusEl.className = type;
+}
+function validParent() {
+  try {
+    return !!window.opener && !!token && !!parentOrigin &&
+      new URL(parentOrigin).origin === parentOrigin &&
+      /^https:\/\//i.test(parentOrigin);
+  } catch (e) {
+    return false;
+  }
+}
+function stopCamera() {
+  if (controls) {
+    try { controls.stop(); } catch(e) {}
+    controls = null;
+  }
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(track => track.stop());
+    cameraStream = null;
+  }
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(track => track.stop());
+    video.srcObject = null;
+  }
+  stopBtn.disabled = true; switchBtn.disabled = true;
+  startBtn.disabled = false;
+}
+async function listCameras() {
+  devices = await BrowserMultiFormatReader.listVideoInputDevices();
+  cameraSelect.innerHTML = '';
+  devices.forEach((d, i) => {
+    const opt = document.createElement('option');
+    opt.value = d.deviceId;
+    opt.textContent = d.label || `Kamera ${i+1}`;
+    cameraSelect.appendChild(opt);
+  });
+  cameraSelect.hidden = devices.length < 2;
+  switchBtn.disabled = devices.length < 2;
+  const back = devices.findIndex(d => /back|rear|environment|belakang/i.test(d.label));
+  activeIndex = back >= 0 ? back : Math.max(0, devices.length - 1);
+  if (devices[activeIndex]) cameraSelect.value = devices[activeIndex].deviceId;
+}
+async function startCamera(deviceId) {
+  if (!window.isSecureContext) return status('Halaman kamera tidak aman. Buka melalui HTTPS.', 'bad');
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return status('Browser tidak mendukung akses kamera. Gunakan Safari atau Chrome versi terbaru.', 'bad');
+  if (!validParent()) return status('Halaman utama tidak terdeteksi. Tutup tab ini dan buka scanner dari aplikasi utama.', 'bad');
+
+  stopCamera();
+  startBtn.disabled = true;
+  status('Meminta izin kamera...');
+  try {
+    // Request permission directly from this user-initiated click.
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: deviceId ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+                      : { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    });
+    video.srcObject = cameraStream;
+    await video.play();
+    await listCameras();
+    status('Kamera aktif. Arahkan barcode ke area kamera.');
+    stopBtn.disabled = false;
+    switchBtn.disabled = devices.length < 2;
+    controls = await reader.decodeFromStream(cameraStream, video, (result, err, ctl) => {
+      if (ctl && !controls) controls = ctl;
+      if (result && !busy) sendBarcode(result.getText());
+    });
+  } catch (err) {
+    stopCamera();
+    const name = err && err.name || '';
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError') status('Izin kamera ditolak. Aktifkan Camera/Kamera pada pengaturan situs di browser, lalu muat ulang.', 'bad');
+    else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') status('Kamera tidak ditemukan pada perangkat ini.', 'bad');
+    else if (name === 'NotReadableError' || name === 'TrackStartError') status('Kamera sedang digunakan aplikasi lain. Tutup aplikasi kamera lain lalu coba lagi.', 'bad');
+    else status('Kamera gagal dibuka: ' + (err.message || name || 'Kesalahan tidak diketahui'), 'bad');
+  }
+}
+function sendBarcode(text) {
+  const resi = String(text || '').trim();
+  if (!resi || busy) return;
+  busy = true;
+  status('Barcode terbaca: ' + resi + '. Menunggu konfirmasi server...');
+  window.opener.postMessage({ type: 'BARCODE_DETECTED', token, resi }, parentOrigin);
+}
+window.addEventListener('message', event => {
+  if (event.source !== window.opener || event.origin !== parentOrigin) return;
+  const msg = event.data || {};
+  if (msg.type !== 'SCAN_RESULT' || msg.token !== token) return;
+  if (msg.ok) {
+    status('✓ ' + (msg.message || 'RESI BERHASIL DISIMPAN') + ' — ' + (msg.resi || ''), 'good');
+    try { if (navigator.vibrate) navigator.vibrate(100); } catch(e) {}
+  } else {
+    status((msg.message || 'Resi gagal disimpan') + (msg.resi ? ' — ' + msg.resi : ''), 'bad');
+    try { if (navigator.vibrate) navigator.vibrate([80,50,80]); } catch(e) {}
+  }
+  setTimeout(() => { busy = false; if (controls) status('Kamera aktif. Siap memindai paket berikutnya.'); }, 1400);
+});
+startBtn.addEventListener('click', () => startCamera());
+stopBtn.addEventListener('click', () => { stopCamera(); status('Kamera ditutup.'); });
+switchBtn.addEventListener('click', async () => {
+  if (!devices.length) return;
+  activeIndex = (activeIndex + 1) % devices.length;
+  cameraSelect.value = devices[activeIndex].deviceId;
+  await startCamera(devices[activeIndex].deviceId);
+});
+cameraSelect.addEventListener('change', () => {
+  const index = devices.findIndex(d => d.deviceId === cameraSelect.value);
+  if (index >= 0) activeIndex = index;
+  startCamera(cameraSelect.value);
+});
+window.addEventListener('pagehide', stopCamera);
+window.addEventListener('beforeunload', stopCamera);
+</script>
+</body>
+</html>
